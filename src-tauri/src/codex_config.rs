@@ -11,6 +11,8 @@ use std::fs;
 use std::path::Path;
 use toml_edit::DocumentMut;
 
+pub const DEFAULT_CODEX_TEST_INSTRUCTIONS: &str = "";
+
 /// 获取 Codex 配置目录路径
 pub fn get_codex_config_dir() -> PathBuf {
     if let Some(custom) = crate::settings::get_codex_override_dir() {
@@ -137,6 +139,47 @@ pub fn read_and_validate_codex_config_text() -> Result<String, AppError> {
     Ok(s)
 }
 
+fn resolve_model_instructions_path(base_dir: &Path, raw_path: &str) -> std::path::PathBuf {
+    let trimmed = raw_path.trim();
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return get_home_dir().join(rest);
+    }
+    if trimmed == "~" {
+        return get_home_dir();
+    }
+
+    let path = std::path::PathBuf::from(trimmed);
+    if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn read_model_instructions_text_with_base(
+    config_toml: &str,
+    base_dir: &Path,
+) -> Result<Option<String>, AppError> {
+    if config_toml.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let table = toml::from_str::<toml::Table>(config_toml)
+        .map_err(|e| AppError::toml(Path::new("config.toml"), e))?;
+    let raw_path = match table.get("model_instructions_file").and_then(|v| v.as_str()) {
+        Some(value) if !value.trim().is_empty() => value.trim(),
+        _ => return Ok(None),
+    };
+
+    let resolved_path = resolve_model_instructions_path(base_dir, raw_path);
+    let text = fs::read_to_string(&resolved_path).map_err(|e| AppError::io(&resolved_path, e))?;
+    Ok(Some(text))
+}
+
+pub fn read_model_instructions_text(config_toml: &str) -> Result<Option<String>, AppError> {
+    read_model_instructions_text_with_base(config_toml, &get_codex_config_dir())
+}
+
 /// Update a field in Codex config.toml using toml_edit (syntax-preserving).
 ///
 /// Supported fields:
@@ -253,6 +296,17 @@ pub fn remove_codex_toml_base_url_if(toml_str: &str, predicate: impl Fn(&str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-switch-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     #[test]
     fn base_url_writes_into_correct_model_provider_section() {
@@ -466,5 +520,34 @@ base_url = "https://production.api/v1"
             .and_then(|v| v.get("base_url"))
             .and_then(|v| v.as_str());
         assert_eq!(base_url, Some("https://production.api/v1"));
+    }
+
+    #[test]
+    fn read_model_instructions_text_loads_relative_file() {
+        let base_dir = unique_temp_dir("instructions-relative");
+        let instructions_path = base_dir.join("instructions.md");
+        std::fs::write(&instructions_path, "Follow repo instructions.\n").expect("write file");
+
+        let config = r#"model = "gpt-5"
+model_instructions_file = "instructions.md"
+"#;
+
+        let result = read_model_instructions_text_with_base(config, &base_dir)
+            .expect("instructions should load");
+        assert_eq!(result.as_deref(), Some("Follow repo instructions.\n"));
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn read_model_instructions_text_returns_none_when_unconfigured() {
+        let base_dir = unique_temp_dir("instructions-none");
+        let config = r#"model = "gpt-5""#;
+
+        let result = read_model_instructions_text_with_base(config, &base_dir)
+            .expect("missing field should be allowed");
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 }

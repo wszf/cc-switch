@@ -530,11 +530,13 @@ impl StreamCheckService {
         // 获取本地系统信息
         let os_name = Self::get_os_name();
         let arch_name = Self::get_arch_name();
+        let instructions = Self::resolve_codex_test_instructions(provider);
 
         // Responses API 请求体格式 (input 必须是数组)
         let mut body = json!({
             "model": actual_model,
             "input": [{ "role": "user", "content": test_prompt }],
+            "instructions": instructions,
             "stream": true
         });
 
@@ -1421,6 +1423,27 @@ impl StreamCheckService {
             .filter(|value| !value.is_empty())
     }
 
+    fn resolve_codex_test_instructions(provider: &Provider) -> String {
+        let config_text = provider
+            .settings_config
+            .get("config")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+
+        match crate::codex_config::read_model_instructions_text(config_text) {
+            Ok(Some(text)) => text,
+            Ok(None) => crate::codex_config::DEFAULT_CODEX_TEST_INSTRUCTIONS.to_string(),
+            Err(err) => {
+                log::warn!(
+                    "[StreamCheck] Failed to load Codex model_instructions_file for {}: {}. Falling back to default instructions.",
+                    provider.id,
+                    err
+                );
+                crate::codex_config::DEFAULT_CODEX_TEST_INSTRUCTIONS.to_string()
+            }
+        }
+    }
+
     /// 获取操作系统名称（映射为 Claude CLI 使用的格式）
     fn get_os_name() -> &'static str {
         match std::env::consts::OS {
@@ -1953,5 +1976,26 @@ mod tests {
                 "https://api.openai.com/v1/responses",
             ]
         );
+    }
+
+    #[test]
+    fn test_resolve_codex_test_instructions_defaults_to_empty_string() {
+        let provider = Provider {
+            id: "codex-default".to_string(),
+            name: "Codex".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: None,
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        let instructions = StreamCheckService::resolve_codex_test_instructions(&provider);
+        assert_eq!(instructions, "");
     }
 }
