@@ -1,0 +1,104 @@
+name: macOS Test Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: macos-test-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-macos-test:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add macOS targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-${{ runner.arch }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-pnpm-store-
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Create test build config
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          src = Path("src-tauri/tauri.conf.json")
+          dst = Path("src-tauri/tauri.test.conf.json")
+          data = json.loads(src.read_text())
+          bundle = data.setdefault("bundle", {})
+          bundle["createUpdaterArtifacts"] = False
+          bundle["targets"] = ["app"]
+          dst.write_text(json.dumps(data, indent=2) + "\n")
+          print(f"wrote {dst}")
+          PY
+
+      - name: Build unsigned macOS app
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm tauri build --config src-tauri/tauri.test.conf.json --target universal-apple-darwin
+
+      - name: Package test app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          APP_PATH=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name "*.app" -type d | head -1 || true)
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app found after build" >&2
+            exit 1
+          fi
+
+          ZIP_PATH="release-assets/CC-Switch-${GITHUB_SHA::7}-macOS-test.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_PATH"
+
+          cat > release-assets/README.txt <<'EOF'
+          This is an unsigned macOS test build.
+
+          If macOS blocks opening it, use one of these:
+          1. Right click the app and choose Open
+          2. Or run:
+             xattr -dr com.apple.quarantine "CC Switch.app"
+          EOF
+
+      - name: Upload test build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-test-build
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
